@@ -125,7 +125,7 @@ public class MainActivity extends AppCompatActivity implements TextWatcher {
     private void getVersion() throws PackageManager.NameNotFoundException {
         PackageInfo pInfo = this.getPackageManager().getPackageInfo(getPackageName(), 0);
         version = pInfo.versionName;
-        this.setTitle("MEND" + getClass().getPackage().getImplementationVersion());
+        this.setTitle("MEND" + version);
     }
 
     private void initializeSettings() throws IOException, CorruptSettingsException {
