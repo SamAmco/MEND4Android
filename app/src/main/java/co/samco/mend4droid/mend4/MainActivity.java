@@ -3,6 +3,7 @@ package co.samco.mend4droid.mend4;
 import android.Manifest;
 import android.content.ContentResolver;
 import android.content.Intent;
+import android.content.pm.PackageInfo;
 import android.content.pm.PackageManager;
 import android.net.Uri;
 import android.os.Environment;
@@ -24,26 +25,38 @@ import android.widget.Toast;
 import java.io.File;
 import java.io.FileInputStream;
 import java.io.FileOutputStream;
+import java.io.IOException;
+import java.security.NoSuchAlgorithmException;
+import java.security.interfaces.RSAPublicKey;
+import java.security.spec.InvalidKeySpecException;
 import java.text.SimpleDateFormat;
 import java.util.ArrayList;
+import java.util.Arrays;
 import java.util.Date;
 import java.util.List;
 
-import co.samco.mend4.core.Config;
-import co.samco.mend4.core.EncryptionUtils;
+import co.samco.mend4.core.AppProperties;
 import co.samco.mend4.core.IBase64EncodingProvider;
 import co.samco.mend4.core.Settings;
+import co.samco.mend4.core.crypto.CryptoProvider;
+import co.samco.mend4.core.crypto.impl.DefaultJCECryptoProvider;
+import co.samco.mend4.core.exception.CorruptSettingsException;
+import co.samco.mend4.core.util.LogUtils;
 
 public class MainActivity extends AppCompatActivity implements TextWatcher {
     private final int PERMISSIONS_REQUEST_READ_STORAGE = 1;
     private final int PERMISSIONS_REQUEST_WRITE_STORAGE = 2;
 
-    AutoCompleteTextView autoCompleteTextView;
-    EditText editText;
+    private AutoCompleteTextView autoCompleteTextView;
+    private EditText editText;
     private boolean initialized = false;
 
-    private String mendDir = "";
-    private String currentLog = "";
+    private String mendDir;
+    private String currentLog;
+    private Settings settings;
+    private CryptoProvider cryptoProvider;
+    private AndroidEncodingProvider encodingProvider;
+    private String version;
 
     private boolean checkSettingsPermissions() {
         if (ContextCompat.checkSelfPermission(this, Manifest.permission.READ_EXTERNAL_STORAGE)
@@ -76,7 +89,7 @@ public class MainActivity extends AppCompatActivity implements TextWatcher {
                 // If request is cancelled, the result arrays are empty.
                 if (grantResults.length > 0 && grantResults[0] == PackageManager.PERMISSION_GRANTED) {
                     if (!initialized)
-                        tryInitializeSettings();
+                        tryInitializeMEND();
                 }
                 return;
             }
@@ -92,30 +105,71 @@ public class MainActivity extends AppCompatActivity implements TextWatcher {
         }
     }
 
-    private void tryInitializeSettings() {
+    private void tryInitializeMEND() {
         if (!initialized && checkSettingsPermissions()) {
             try {
-                Settings.InitializeSettings(new AndroidSettings(mendDir));
+                initializeSettings();
+                getVersion();
                 indexLogFiles();
-                currentLog = Settings.instance().getValue(Config.Settings.CURRENTLOG);
-                autoCompleteTextView.setText(currentLog);
+                initializeEncodingProvider();
+                initializeCryptoProvider();
                 initialized = true;
             } catch (Exception e) {
                 Log.wtf("MainActivity", e.getMessage());
+                Toast toast = Toast.makeText(this.getApplicationContext(), e.getMessage(), Toast.LENGTH_LONG);
+                toast.show();
             }
         }
     }
 
-    private void indexLogFiles() {
-        File mendDirFile = new File(mendDir);
-        File[] files = mendDirFile.listFiles();
-        List<String> names = new ArrayList<String>();
-        for (int i = 0; i < files.length; ++i) {
-            String name = files[i].getName();
-            if (name.endsWith(".mend"))
-                names.add(name.substring(0, name.length() - 5));
+    private void getVersion() throws PackageManager.NameNotFoundException {
+        PackageInfo pInfo = this.getPackageManager().getPackageInfo(getPackageName(), 0);
+        version = pInfo.versionName;
+        this.setTitle("MEND" + getClass().getPackage().getImplementationVersion());
+    }
+
+    private void initializeSettings() throws IOException, CorruptSettingsException {
+        mendDir = Environment.getExternalStorageDirectory().getAbsolutePath() + "/MEND4/";
+        settings = new AndroidSettings(mendDir);
+        currentLog = settings.getValue(Settings.Name.CURRENTLOG);
+        autoCompleteTextView.setText(currentLog);
+    }
+
+    private void initializeEncodingProvider() {
+        encodingProvider = new AndroidEncodingProvider();
+    }
+
+    private void initializeCryptoProvider() throws IOException, CorruptSettingsException {
+        int aesKeySize = AppProperties.PREFERRED_AES_KEY_SIZE;
+        int rsaKeySize = AppProperties.PREFERRED_RSA_KEY_SIZE;
+        String preferredAES = AppProperties.PREFERRED_AES_ALG;
+        String preferredRSA = AppProperties.PREFERRED_RSA_ALG;
+        if (settings.valueSet(Settings.Name.AESKEYSIZE)) {
+            aesKeySize = Integer.parseInt(settings.getValue(Settings.Name.AESKEYSIZE));
         }
-        ArrayAdapter<String> adapter = new ArrayAdapter<String>(this, android.R.layout.simple_dropdown_item_1line,
+        if (settings.valueSet(Settings.Name.RSAKEYSIZE)) {
+            rsaKeySize = Integer.parseInt(settings.getValue(Settings.Name.RSAKEYSIZE));
+        }
+        if (settings.valueSet(Settings.Name.PREFERREDAES)) {
+            preferredAES = settings.getValue(Settings.Name.PREFERREDAES);
+        }
+        if (settings.valueSet(Settings.Name.PREFERREDRSA)) {
+            preferredRSA = settings.getValue(Settings.Name.PREFERREDRSA);
+        }
+        cryptoProvider = new DefaultJCECryptoProvider(AppProperties.STANDARD_IV, aesKeySize, rsaKeySize,
+                preferredAES, preferredRSA, AppProperties.PASSCHECK_SALT, AppProperties.AES_KEY_GEN_ITERATIONS,
+                encodingProvider);
+    }
+
+    private void indexLogFiles() {
+        List<String> names = new ArrayList<>();
+        for (File f : new File(mendDir).listFiles()) {
+            String name = f.getName();
+            if (name.endsWith("." + AppProperties.LOG_FILE_EXTENSION)) {
+                names.add(name.substring(0, name.length()-5));
+            }
+        }
+        ArrayAdapter<String> adapter = new ArrayAdapter<>(this, android.R.layout.simple_dropdown_item_1line,
                 names);
         autoCompleteTextView.setAdapter(adapter);
     }
@@ -124,12 +178,10 @@ public class MainActivity extends AppCompatActivity implements TextWatcher {
     protected void onCreate(Bundle savedInstanceState) {
         super.onCreate(savedInstanceState);
         setContentView(R.layout.activity_main);
-        this.setTitle("MEND4." + AndroidSettings.ANDROID_VERSION);
-        autoCompleteTextView = (AutoCompleteTextView) findViewById(R.id.autoCompleteTextView);
+        autoCompleteTextView = findViewById(R.id.autoCompleteTextView);
         autoCompleteTextView.addTextChangedListener(this);
-        editText = (EditText) findViewById(R.id.entryText);
-        mendDir = Environment.getExternalStorageDirectory().getAbsolutePath() + "/MEND4/";
-        tryInitializeSettings();
+        editText = findViewById(R.id.entryText);
+        tryInitializeMEND();
     }
 
     //File button callback
@@ -149,52 +201,40 @@ public class MainActivity extends AppCompatActivity implements TextWatcher {
     protected void onActivityResult(int requestCode, int resultCode, Intent data) {
         //Encrypt selected file
         if (requestCode == 1 && resultCode == RESULT_OK) {
-            FileInputStream fis = null;
-            try {
-                FileOutputStream fos = null;
-                try {
-                    Uri uri = data.getData();
-                    ContentResolver cR = getContentResolver();
-                    MimeTypeMap mime = MimeTypeMap.getSingleton();
-                    String fileExtension = mime.getExtensionFromMimeType(cR.getType(uri));
-                    fis = (FileInputStream) cR.openInputStream(uri);
-                    String name = new SimpleDateFormat("yyyyMMddHHmmssSS").format(new Date());
-                    File file = new File(mendDir + "/Enc", name + ".enc");
-                    file.getParentFile().mkdirs();
-                    //TODO check if file exists (which probably needs doing when we enable encrypting multiple files
-                    // at once)
-                    fos = new FileOutputStream(file);
-                    EncryptionUtils.encryptFileToStream(new AndroidEncodingProvider(), fis, fos, fileExtension);
-                    Toast toast = Toast.makeText(this.getApplicationContext(), "File encryption complete", Toast
-                            .LENGTH_SHORT);
-                    toast.show();
-                    editText.append(name);
-                } catch (Exception e) {
+            ContentResolver cR = getContentResolver();
+            Uri uri = data.getData();
+            MimeTypeMap mime = MimeTypeMap.getSingleton();
+            String fileExtension = mime.getExtensionFromMimeType(cR.getType(uri));
+            String name = new SimpleDateFormat(AppProperties.ENC_FILE_NAME_FORMAT).format(new Date());
+            File file = new File(mendDir + File.separator + "Enc", name + "." + AppProperties.ENC_FILE_EXTENSION);
+            file.getParentFile().mkdirs();
+            try (FileInputStream fis = (FileInputStream) cR.openInputStream(uri);
+                FileOutputStream fos = new FileOutputStream(file, false)) {
+                file.getParentFile().mkdirs();
+                cryptoProvider.encryptEncStream(getPublicKey(), fis, fos, fileExtension);
+                Toast toast = Toast.makeText(this.getApplicationContext(), "File encryption complete", Toast
+                        .LENGTH_SHORT);
+                toast.show();
+                editText.append(name);
+            } catch (Exception e) {
                     Log.wtf("MainActivity", e.getMessage());
                     Toast toast = Toast.makeText(this.getApplicationContext(), e.getMessage(), Toast.LENGTH_LONG);
                     toast.show();
-                } finally {
-                    try {
-                        if (fos != null)
-                            fos.close();
-                    } catch (Exception e) {
-                    }
-                }
-            } finally {
-                try {
-                    if (fis != null)
-                        fis.close();
-                } catch (Exception e) {
-                }
             }
         }
+    }
+
+    private RSAPublicKey getPublicKey() throws IOException, CorruptSettingsException, InvalidKeySpecException, NoSuchAlgorithmException {
+        String pubKeyString = settings.getValue(Settings.Name.PUBLICKEY);
+        byte[] publicKeyBytes = encodingProvider.decodeBase64(pubKeyString);
+        return cryptoProvider.getPublicKeyFromBytes(publicKeyBytes);
     }
 
     private boolean doubleCheckPermissions(View view) {
         if (!initialized) {
             Toast toast = Toast.makeText(view.getContext(), "Could not read from storage.", Toast.LENGTH_LONG);
             toast.show();
-            tryInitializeSettings();
+            tryInitializeMEND();
             return false;
         }
         if (!checkWritePermissions()) {
@@ -217,26 +257,18 @@ public class MainActivity extends AppCompatActivity implements TextWatcher {
             return;
         }
 
-        FileOutputStream fos = null;
-        try {
-            Settings.instance().setValue(Config.Settings.CURRENTLOG, currentLog);
-            File file = new File(mendDir, currentLog + ".mend");
+        File file = new File(mendDir, currentLog + "." + AppProperties.LOG_FILE_EXTENSION);
+        try (FileOutputStream fos = new FileOutputStream(file, true)){
+            settings.setValue(Settings.Name.CURRENTLOG, currentLog);
             file.createNewFile();
-            fos = new FileOutputStream(file, true);
-            EncryptionUtils.encryptLogToStream(new AndroidEncodingProvider(), fos, logText.toCharArray(), false);
+            logText = LogUtils.addHeaderToLogText(logText, "DROID", version, "\n");
+            cryptoProvider.encryptLogStream(getPublicKey(), logText, fos);
             editText.getText().clear();
             indexLogFiles();
         } catch (Exception e) {
             Log.wtf("MainActivity", e.getMessage());
             Toast toast = Toast.makeText(view.getContext(), e.getMessage(), Toast.LENGTH_LONG);
             toast.show();
-        } finally {
-            try {
-                if (fos != null)
-                    fos.close();
-            } catch (Exception e) {
-                Log.wtf("MainActivity", e.getMessage());
-            }
         }
     }
 
@@ -247,12 +279,10 @@ public class MainActivity extends AppCompatActivity implements TextWatcher {
     }
 
     @Override
-    public void beforeTextChanged(CharSequence s, int start, int count, int after) {
-    }
+    public void beforeTextChanged(CharSequence s, int start, int count, int after) { }
 
     @Override
-    public void afterTextChanged(Editable s) {
-    }
+    public void afterTextChanged(Editable s) { }
 
     private class AndroidEncodingProvider implements IBase64EncodingProvider {
         public byte[] decodeBase64(String s) {
